@@ -5,6 +5,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import lombok.extern.slf4j.Slf4j;
@@ -19,6 +21,33 @@ import org.apache.pulsar.client.api.Reader;
 import org.apache.pulsar.client.api.transaction.Transaction;
 import org.apache.pulsar.client.api.transaction.TxnID;
 import org.apache.pulsar.client.impl.MessageIdImpl;
+
+/**
+ * 1. snapshot segment size.
+ * 2. snapshot index.
+ * 3. unsealed aborted transactions.
+ *
+ * Snapshot segment and unsealed aborted transactions should be matched to maxReadPosition.
+ *
+ * maxReadPosition 更新到某个位置之后，snapshot segment也会更新到对应的数量。
+ * snapshot index 不一定需要和segment对应的上
+ *
+ *
+ *
+ * 给定一个maxReadPosition，那么一定读取不到aborted transaction message
+ * //TODO：增加 Admin API： 应该获取的核心数据是： maxReadPosition，segment size，unseal aborted transaction IDs number
+ *
+ * 测试的逻辑是：
+ * <p>
+*   > 一个线程A不断的使用transaction发送单条消息，并且abort这些transaction。
+*   记录每个maxReadPosition对应的segment size 和unseal aborts的数量。
+*   每发完一个segment的transaction之后，发一个普通消息。
+*   > 一个线程B使用admin tool获取snapshot 的数据，判断maxReadPosition对应的 snapshot segment size和
+*   unseal aborted transaction IDs 的数量 是否对的上
+*   >一个线程C创建reader 去读取这个topic的消息，保证读取不到aborted transaction的消息。
+*   每个小时重新创建一次Reader 去重新读取消息。
+ * </p>
+ */
 
 @Slf4j
 public class TransactionMultipleSnapshotTest {
@@ -49,33 +78,29 @@ public class TransactionMultipleSnapshotTest {
     }
 
     public static void main(String[] args) {
-
+        ExecutorService executor = Executors.newFixedThreadPool(3);
+        executor.submit(() -> {
+            try {
+                sendThreadA();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }); executor.submit(() -> {
+            try {
+                verifyMultipleSnapshotThreadB();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }); executor.submit(() -> {
+            try {
+                verifyMessagesThreadC();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
     }
 
-    /**
-     * 1. snapshot segment size.
-     * 2. snapshot index.
-     * 3. unsealed aborted transactions.
-     *
-     * Snapshot segment and unsealed aborted transactions should be matched to maxReadPosition.
-     *
-     * maxReadPosition 更新到某个位置之后，snapshot segment也会更新到对应的数量。
-     * snapshot index 不一定需要和segment对应的上
-     *
-     *
-     *
-     * 给定一个maxReadPosition，那么一定读取不到aborted transaction message
-     * //TODO：增加 Admin API： 应该获取的核心数据是： maxReadPosition，segment size，unseal aborted transaction IDs number
-     *
-     * 测试的逻辑是：
-     * > 一个线程A不断的使用transaction发送单条消息，并且abort这些transaction。
-     * 记录每个maxReadPosition对应的segment size 和unseal aborts的数量。
-     * 每发完一个segment的transaction之后，发一个普通消息。
-     * > 一个线程B使用admin tool获取snapshot 的数据，判断maxReadPosition对应的 snapshot segment size和
-     * unseal aborted transaction IDs 的数量 是否对的上
-     * >一个线程C创建reader 去读取这个topic的消息，保证读取不到aborted transaction的消息。
-     * 每个小时重新创建一次Reader 去重新读取消息。
-     */
+
     private static void sendThreadA() throws Exception {
         Producer<byte[]> producer = pulsarClient
                 .newProducer()
