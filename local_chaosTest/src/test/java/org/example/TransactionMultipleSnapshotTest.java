@@ -39,13 +39,14 @@ import org.apache.pulsar.client.impl.MessageIdImpl;
  *
  * 测试的逻辑是：
  * <p>
-*   > 一个线程A不断的使用transaction发送单条消息，并且abort这些transaction。
+*     线程A不断的使用transaction发送单条消息，并且abort这些transaction。
 *   记录每个maxReadPosition对应的segment size 和unseal aborts的数量。
 *   每发完一个segment的transaction之后，发一个普通消息。
-*   > 一个线程B使用admin tool获取snapshot 的数据，判断maxReadPosition对应的 snapshot segment size和
+*     线程B使用admin tool获取snapshot 的数据，判断maxReadPosition对应的 snapshot segment size和
 *   unseal aborted transaction IDs 的数量 是否对的上
-*   >一个线程C创建reader 去读取这个topic的消息，保证读取不到aborted transaction的消息。
+*     线程C创建reader 去读取这个topic的消息，保证读取不到aborted transaction的消息。
 *   每个小时重新创建一次Reader 去重新读取消息。
+ *    线程D每隔30分钟unload 一次 test topic.
  * </p>
  */
 
@@ -85,15 +86,24 @@ public class TransactionMultipleSnapshotTest {
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
-        }); executor.submit(() -> {
+        });
+        executor.submit(() -> {
             try {
                 verifyMultipleSnapshotThreadB();
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
-        }); executor.submit(() -> {
+        });
+        executor.submit(() -> {
             try {
                 verifyMessagesThreadC();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+        executor.submit(() -> {
+            try {
+                unloadTopicThreadD();
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
@@ -168,6 +178,15 @@ public class TransactionMultipleSnapshotTest {
                     System.exit(1);
                 }
             }
+        }
+    }
+
+    public static void unloadTopicThreadD() throws Exception {
+        //Unload the origin topic every 30 minutes.
+        while (true) {
+            PulsarAdmin admin = PulsarAdmin.builder().serviceHttpUrl("http://localhost:8080").build();
+            admin.topics().unload(testTopic);
+            Thread.sleep(TimeUnit.MINUTES.toMillis(30));
         }
     }
 
