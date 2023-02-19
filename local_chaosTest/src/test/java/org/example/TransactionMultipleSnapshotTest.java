@@ -1,5 +1,6 @@
 package org.example;
 
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
@@ -21,6 +22,7 @@ import org.apache.pulsar.client.api.Reader;
 import org.apache.pulsar.client.api.transaction.Transaction;
 import org.apache.pulsar.client.api.transaction.TxnID;
 import org.apache.pulsar.client.impl.MessageIdImpl;
+import org.apache.pulsar.common.policies.data.TransactionBufferStats;
 
 /**
  * 1. snapshot segment size.
@@ -30,22 +32,19 @@ import org.apache.pulsar.client.impl.MessageIdImpl;
  * Snapshot segment and unsealed aborted transactions should be matched to maxReadPosition.
  *
  * maxReadPosition 更新到某个位置之后，snapshot segment也会更新到对应的数量。
- * snapshot index 不一定需要和segment对应的上
- *
- *
- *
+ * snapshot index 不一定需要和segment对应的上 所以不需要单独测index
  * 给定一个maxReadPosition，那么一定读取不到aborted transaction message
  * //TODO：增加 Admin API： 应该获取的核心数据是： maxReadPosition，segment size，unseal aborted transaction IDs number
  *
  * 测试的逻辑是：
  * <p>
-*     线程A不断的使用transaction发送单条消息，并且abort这些transaction。
-*   记录每个maxReadPosition对应的segment size 和unseal aborts的数量。
-*   每发完一个segment的transaction之后，发一个普通消息。
-*     线程B使用admin tool获取snapshot 的数据，判断maxReadPosition对应的 snapshot segment size和
-*   unseal aborted transaction IDs 的数量 是否对的上
-*     线程C创建reader 去读取这个topic的消息，保证读取不到aborted transaction的消息。
-*   每个小时重新创建一次Reader 去重新读取消息。
+ *     线程A不断的使用transaction发送单条消息，并且abort这些transaction。
+ *   记录每个maxReadPosition对应的segment size 和unseal aborts的数量。
+ *   每发完一个segment的transaction之后，发一个普通消息。
+ *     线程B使用admin tool获取snapshot 的数据，判断maxReadPosition对应的 snapshot segment size和
+ *   unseal aborted transaction IDs 的数量 是否对的上
+ *     线程C创建reader 去读取这个topic的消息，保证读取不到aborted transaction的消息。
+ *   每个小时重新创建一次Reader 去重新读取消息。
  *    线程D每隔30分钟unload 一次 test topic.
  * </p>
  */
@@ -79,7 +78,7 @@ public class TransactionMultipleSnapshotTest {
     }
 
     public static void main(String[] args) {
-        ExecutorService executor = Executors.newFixedThreadPool(3);
+        ExecutorService executor = Executors.newFixedThreadPool(4);
         executor.submit(() -> {
             try {
                 sendThreadA();
@@ -136,27 +135,32 @@ public class TransactionMultipleSnapshotTest {
             Position maxReadPosition = new Position(messageID.getLedgerId(), messageID.getEntryId() - 1);
             //We can use the total size of aborted transaction to calculative the segment size and unsealed aborts.
             maxReadPositionMap.put(maxReadPosition, abortedTxnCounter.get());
+            log.info("record max read position [{}], aborts counter [{}]", maxReadPosition.toString(),
+                    abortedTxnCounter.get());
             //Send 2 messages that can be received by consumer to make the maxReadPosition move.
+            receiveMessageIds.add(messageID);
             ongoingTxn.commit().get();
-            producer.newMessage().value("message".getBytes()).send();
+            MessageId messageId = producer.newMessage().value("message".getBytes()).send();
+            receiveMessageIds.add(messageId);
+            log.info("send message [{}], commit txn message [{}]", messageID.toString(), messageId.toString());
         }
     }
 
     private static void verifyMultipleSnapshotThreadB() throws Exception {
         PulsarAdmin admin = PulsarAdmin.builder().serviceHttpUrl("http://localhost:8080").build();
-        SnapshotInfo snapshotInfo = null;
-        long abortedTxnSize = maxReadPositionMap.get(new Position(snapshotInfo.maxReadPositionLedgerID,
-                snapshotInfo.maxReadPositionEntryID));
-
+        TransactionBufferStats stats = admin.transactions().getTransactionBufferStats(testTopic);
+        long[] arr = Arrays.stream(stats.maxReadPosition.split(":")).mapToLong(Long::getLong).toArray();
+        //获取对应aborted transaction IDs 的数量
+        long abortedTxnSize = maxReadPositionMap.get(new Position(arr[0], arr[1]));
         long segmentSize = abortedTxnSize / segmentCapital;
         long unsealedAborts = abortedTxnSize % segmentCapital;
-        if (segmentSize != snapshotInfo.segmentSize || unsealedAborts != snapshotInfo.unsealedAborts) {
-            log.error("Expect segmentSize [{}] but found [{}]", segmentSize, snapshotInfo.segmentSize);
-            log.error("Expect unsealedAborts [{}] but found [{}]", unsealedAborts, snapshotInfo.unsealedAborts);
+        //Because the processor record aborted transaction ID first and record max read position secondly,
+        //the unsealed aborted transaction IDs should >= the real unsealedAborts.
+        if (segmentSize != stats.segmentSize || unsealedAborts <= stats.unsealedAbortTxnIDs) {
+            log.error("Expect segmentSize [{}] but found [{}]", segmentSize, stats.segmentSize);
+            log.error("Expect unsealedAborts [{}] but found [{}]", unsealedAborts, stats.unsealedAbortTxnIDs);
             System.exit(0);
         }
-
-
     }
 
     private static void verifyMessagesThreadC() throws Exception {
@@ -186,6 +190,7 @@ public class TransactionMultipleSnapshotTest {
         while (true) {
             PulsarAdmin admin = PulsarAdmin.builder().serviceHttpUrl("http://localhost:8080").build();
             admin.topics().unload(testTopic);
+            log.info("Unload topic");
             Thread.sleep(TimeUnit.MINUTES.toMillis(30));
         }
     }
@@ -215,13 +220,14 @@ public class TransactionMultipleSnapshotTest {
         public int hashCode() {
             return Objects.hash(ledgerID, entryID);
         }
+
+        @Override
+        public String toString() {
+            return "Position{" +
+                    "ledgerID=" + ledgerID +
+                    ", entryID=" + entryID +
+                    '}';
+        }
     }
 
-
-    public static class SnapshotInfo {
-        long segmentSize;
-        long unsealedAborts;
-        long maxReadPositionLedgerID;
-        long maxReadPositionEntryID;
-    }
 }
